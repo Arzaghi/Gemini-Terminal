@@ -1,0 +1,3 @@
+api_key = "YOUR_GEMINI_API_KEY"
+model = "gemini-3.6-flash"
+models = ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
