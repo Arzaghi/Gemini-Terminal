@@ -2,11 +2,12 @@
 name = "gemini-terminal"
 version = "0.1.0"
 edition = "2024"
-description = "A minimal terminal client for the Gemini API"
+description = "A terminal and lightweight desktop client for the Gemini API"
 
 [dependencies]
 anyhow = "1"
 crossterm = "0.28"
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

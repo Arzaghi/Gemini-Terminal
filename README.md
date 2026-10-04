@@ -1,6 +1,6 @@
 # Gemini Terminal
 
-A small terminal app for sending prompts to Google Gemini and reading the response.
+A terminal client for Google Gemini with an optional lightweight desktop GUI.
 
 ## Install
 
@@ -27,19 +27,20 @@ install -Dm755 target/release/gemini-terminal "$HOME/.local/bin/gemini-terminal"
 
 ## Configure
 
-Create the private XDG config file and edit it:
+Create the private XDG config file:
 
 ```sh
 gemini-terminal --init
-${EDITOR:-vi} "${XDG_CONFIG_HOME:-$HOME/.config}/gemini-terminal/config.toml"
 ```
 
-The file is created with owner-only permissions. Its contents look like this:
+The file is created with owner-only permissions. For terminal mode, set the API key in the config file. To enter it in the GUI, launch with `--gui` and use the Options page. Its config looks like this:
 
 ```toml
 api_key = "YOUR_GEMINI_API_KEY"
 model = "gemini-3.6-flash"
 models = ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
+font_path = ""
+right_to_left = false
 ```
 
 `model` selects the startup model. The app refreshes `models` from Google's API when first run and then no more than once every three days. The fetched list and `models_updated_at` timestamp are saved in the config. Only models that support `generateContent` are listed. If the refresh is unavailable, the last saved model list remains usable. See `gemini.example.toml` for the initial template. Use `--config PATH` to load a config from a custom location.
@@ -50,13 +51,19 @@ models = ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
 cargo run
 ```
 
+By default, the app runs in the terminal. Launch the desktop GUI explicitly with:
+
+```sh
+cargo run -- --gui
+```
+
 To load a config file from another location:
 
 ```sh
 cargo run -- --config /path/to/config.toml
 ```
 
-Use `gemini-terminal --model gemini-3.5-flash-lite` to choose and save a startup model. The app uses the normal terminal scrollback: enter a prompt at `Prompt:`, then the reply appears at `Response:`, with a blank line between turns. Press F2 to show a numbered list of available models, type its number, and press Enter. The selected model is saved to the config. Ctrl+C or Esc quits while entering a prompt.
+Use `gemini-terminal --model gemini-3.5-flash-lite` to choose and save a startup model. Terminal mode remains the default; add `--gui` to open the desktop interface. In the GUI, use the Chat page for multiline prompts and the Options page to update the API key and model. To display Persian, install a Persian-capable TTF/OTF font, enter its file path in Options, and enable right-to-left layout when desired. Settings are saved to the private XDG config file.
 
 ## Tests
 

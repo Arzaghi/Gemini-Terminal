@@ -2,14 +2,18 @@ use std::{
     env, fs,
     io::{self, Write, stdout},
     path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    cursor::MoveTo,
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyModifiers},
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
 };
+use eframe::egui::{self, Align, FontData, FontDefinitions, FontFamily, Key, Layout, RichText};
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 
@@ -23,6 +27,10 @@ struct Config {
     models: Vec<String>,
     #[serde(default)]
     models_updated_at: Option<i64>,
+    #[serde(default)]
+    font_path: String,
+    #[serde(default)]
+    right_to_left: bool,
 }
 
 #[derive(Deserialize)]
@@ -44,6 +52,7 @@ struct CliOptions {
     config_path: Option<PathBuf>,
     model: Option<String>,
     initialize: bool,
+    gui: bool,
     help: bool,
 }
 
@@ -58,12 +67,35 @@ enum InputAction {
     Quit,
 }
 
+struct GeminiApp {
+    config: Config,
+    config_path: PathBuf,
+    status: String,
+    page: Page,
+    prompt: String,
+    messages: Vec<Message>,
+    sending: bool,
+    response_receiver: Option<Receiver<Result<String, String>>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Chat,
+    Options,
+}
+
+struct Message {
+    from_user: bool,
+    text: String,
+}
+
 fn main() -> Result<()> {
     let options = parse_args(env::args().skip(1))?;
     if options.help {
         println!(
-            "Usage: gemini-terminal [--config PATH] [--model ID] [--init]\n\n\
+            "Usage: gemini-terminal [--gui] [--config PATH] [--model ID] [--init]\n\n\
                  --init       Create a private config file at the standard XDG path\n\
+                  --gui        Launch the desktop GUI instead of the terminal app\n\
                  --model ID   Start with one of the configured models\n\
                  --config     Read a config file from a custom path"
         );
@@ -90,8 +122,11 @@ fn main() -> Result<()> {
     })?;
     let mut config: Config = toml::from_str(&config_text)
         .with_context(|| format!("Could not parse config file: {}", config_path.display()))?;
-    if config.api_key.trim().is_empty() || config.model.trim().is_empty() {
-        bail!("Both `api_key` and `model` must be set in the config file");
+    if config.api_key == "YOUR_GEMINI_API_KEY" {
+        config.api_key.clear();
+    }
+    if config.model.trim().is_empty() {
+        bail!("The `model` must be set in the config file");
     }
     if config.models.iter().any(|model| model.trim().is_empty()) {
         bail!("The `models` array cannot contain an empty model name");
@@ -99,7 +134,7 @@ fn main() -> Result<()> {
 
     let mut status = String::from("Ready");
     let now = unix_time_now();
-    if should_refresh_models(config.models_updated_at, now) {
+    if !config.api_key.is_empty() && should_refresh_models(config.models_updated_at, now) {
         match list_available_models(&config.api_key) {
             Ok(models) if !models.is_empty() => {
                 config.models = models;
@@ -115,7 +150,13 @@ fn main() -> Result<()> {
     }
     if config.models.is_empty() {
         config.models = default_models();
-        status = String::from("No cached models; using built-in model list");
+        status = if config.api_key.is_empty() {
+            String::from("Add your Gemini API key in Options")
+        } else {
+            String::from("No cached models; using built-in model list")
+        };
+    } else if config.api_key.is_empty() {
+        status = String::from("Add your Gemini API key in Options");
     }
 
     if let Some(model) = options.model {
@@ -130,7 +171,20 @@ fn main() -> Result<()> {
         status = String::from("Saved model unavailable; selected the first available model");
     }
 
-    run_app(config, config_path, status)
+    if options.gui && config.font_path.is_empty() {
+        config.font_path = default_persian_font_path().unwrap_or_default();
+    }
+
+    if options.gui {
+        run_gui(config, config_path, status)
+    } else {
+        if config.api_key.trim().is_empty() {
+            bail!(
+                "Set `api_key` in the config file or run `gemini-terminal --gui` to enter it in Options"
+            );
+        }
+        run_terminal(config, config_path, status)
+    }
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<CliOptions> {
@@ -138,6 +192,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CliOptions> {
         config_path: None,
         model: None,
         initialize: false,
+        gui: false,
         help: false,
     };
     let mut args = args;
@@ -152,9 +207,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CliOptions> {
                 options.model = Some(args.next().context("Expected a model ID after --model")?);
             }
             "--init" => options.initialize = true,
+            "--gui" => options.gui = true,
             "-h" | "--help" => options.help = true,
             _ => bail!(
-                "Unknown argument: {argument}\nUsage: gemini-terminal [--config PATH] [--model ID] [--init]"
+                "Unknown argument: {argument}\nUsage: gemini-terminal [--gui] [--config PATH] [--model ID] [--init]"
             ),
         }
     }
@@ -324,13 +380,13 @@ fn persist_model_selection(path: &Path, config: &mut Config, model: &str) -> Res
     Ok(())
 }
 
-fn run_app(config: Config, config_path: PathBuf, status: String) -> Result<()> {
+fn run_terminal(config: Config, config_path: PathBuf, status: String) -> Result<()> {
     let mut app = App {
         config,
         config_path,
     };
     println!(
-        "Gemini Terminal | {} | F2: models | Ctrl+C: quit",
+        "Gemini Terminal | {} | Enter: send | Ctrl+J: newline | Ctrl+L: clear | F2: models | Ctrl+C: quit",
         app.config.model
     );
     if status != "Ready" {
@@ -339,7 +395,7 @@ fn run_app(config: Config, config_path: PathBuf, status: String) -> Result<()> {
 
     let mut prompt = String::new();
     loop {
-        print!("\n------------\nPrompt: {prompt}");
+        print!("\n\nPrompt:\n  {}", prompt.replace('\n', "\n  "));
         stdout().flush()?;
         match read_prompt(std::mem::take(&mut prompt))? {
             InputAction::Quit => return Ok(()),
@@ -351,14 +407,14 @@ fn run_app(config: Config, config_path: PathBuf, status: String) -> Result<()> {
                 println!("Prompt cannot be empty.\n");
             }
             InputAction::Submit(prompt) => {
-                print!("Response: ");
+                println!("Response:");
                 stdout().flush()?;
                 let response =
                     match generate_content(&app.config.api_key, &app.config.model, &prompt) {
                         Ok(response) => response,
                         Err(error) => format!("Error: {error}"),
                     };
-                print!("{response}");
+                print!("  {}", response.replace('\n', "\n  "));
                 if !response.ends_with('\n') {
                     println!();
                 }
@@ -370,22 +426,58 @@ fn run_app(config: Config, config_path: PathBuf, status: String) -> Result<()> {
 
 fn read_prompt(prompt: String) -> Result<InputAction> {
     enable_raw_mode().context("Could not enable terminal input mode")?;
+    if let Err(error) = crossterm::execute!(stdout(), EnableBracketedPaste) {
+        let _ = disable_raw_mode();
+        return Err(error).context("Could not enable bracketed paste");
+    }
     let input = read_prompt_raw(prompt);
+    let paste_restore = crossterm::execute!(stdout(), DisableBracketedPaste)
+        .context("Could not disable bracketed paste");
     let restore = disable_raw_mode().context("Could not restore terminal input mode");
+    paste_restore?;
     restore?;
     input
 }
 
 fn read_prompt_raw(mut prompt: String) -> Result<InputAction> {
     loop {
-        let Event::Key(key) = event::read()? else {
+        let event = event::read()?;
+        if let Event::Paste(text) = event {
+            let pasted = text.replace("\r\n", "\n").replace('\r', "\n");
+            prompt.push_str(&pasted);
+            print!("{}", pasted.replace('\n', "\r\n  "));
+            stdout().flush()?;
             continue;
-        };
+        }
+        let Event::Key(key) = event else { continue };
         match key.code {
             KeyCode::F(2) => {
                 print!("\r\n");
                 stdout().flush()?;
                 return Ok(InputAction::SelectModel(prompt));
+            }
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                crossterm::execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
+                print!("Prompt:\n  {}", prompt.replace('\n', "\n  "));
+                stdout().flush()?;
+            }
+            KeyCode::Char('\x0C') => {
+                crossterm::execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
+                print!("Prompt:\n  {}", prompt.replace('\n', "\n  "));
+                stdout().flush()?;
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                prompt.push('\n');
+                print!("\r\n  ");
+                stdout().flush()?;
+            }
+            KeyCode::Char('\n') | KeyCode::Char('j')
+                if key.code == KeyCode::Char('\n')
+                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                prompt.push('\n');
+                print!("\r\n  ");
+                stdout().flush()?;
             }
             KeyCode::Enter => {
                 print!("\r\n");
@@ -462,6 +554,296 @@ fn choose_model(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+fn run_gui(config: Config, config_path: PathBuf, status: String) -> Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([940.0, 720.0])
+            .with_min_inner_size([680.0, 520.0]),
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Gemini Terminal",
+        options,
+        Box::new(move |creation_context| {
+            creation_context
+                .egui_ctx
+                .set_visuals(egui::Visuals::light());
+            let font_status = apply_persian_font(&creation_context.egui_ctx, &config.font_path)
+                .err()
+                .map(|error| format!("Could not load Persian font: {error}"));
+            Ok(Box::new(GeminiApp {
+                config,
+                config_path,
+                status: font_status.unwrap_or(status),
+                page: Page::Chat,
+                prompt: String::new(),
+                messages: Vec::new(),
+                sending: false,
+                response_receiver: None,
+            }))
+        }),
+    )
+    .map_err(|error| anyhow::anyhow!("Could not launch desktop window: {error}"))
+}
+
+impl eframe::App for GeminiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let received = self
+            .response_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+        match received {
+            Some(Ok(Ok(response))) => {
+                self.messages.push(Message {
+                    from_user: false,
+                    text: response,
+                });
+                self.status = String::from("Ready");
+                self.sending = false;
+                self.response_receiver = None;
+            }
+            Some(Ok(Err(error))) => {
+                self.messages.push(Message {
+                    from_user: false,
+                    text: format!("Error: {error}"),
+                });
+                self.status = String::from("Request failed");
+                self.sending = false;
+                self.response_receiver = None;
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.status = String::from("Request stopped unexpectedly");
+                self.sending = false;
+                self.response_receiver = None;
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+
+        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Gemini Terminal");
+                ui.separator();
+                ui.label(&self.config.model);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .selectable_label(self.page == Page::Options, "Options")
+                        .clicked()
+                    {
+                        self.page = Page::Options;
+                    }
+                    if ui
+                        .selectable_label(self.page == Page::Chat, "Chat")
+                        .clicked()
+                    {
+                        self.page = Page::Chat;
+                    }
+                });
+            });
+            if !self.status.is_empty() {
+                ui.small(&self.status);
+            }
+        });
+
+        if self.page == Page::Chat {
+            egui::TopBottomPanel::bottom("composer").show(ctx, |ui| {
+                ui.add_space(6.0);
+                let text_alignment = if self.config.right_to_left {
+                    Align::RIGHT
+                } else {
+                    Align::LEFT
+                };
+                let editor_width = ui.available_width();
+                let editor = egui::TextEdit::multiline(&mut self.prompt)
+                    .desired_rows(4)
+                    .desired_width(editor_width)
+                    .hint_text("Write a message...")
+                    .horizontal_align(text_alignment);
+                egui::ScrollArea::vertical()
+                    .id_salt("prompt-editor-scroll")
+                    .max_height(112.0)
+                    .min_scrolled_height(112.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(editor_width);
+                        ui.add(editor);
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("Enter adds a line; Ctrl+Enter sends");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let send = ui.add_enabled(
+                            !self.sending && !self.prompt.trim().is_empty(),
+                            egui::Button::new("Send"),
+                        );
+                        let send_from_keyboard =
+                            ui.input(|input| input.key_pressed(Key::Enter) && input.modifiers.ctrl);
+                        if send.clicked() || send_from_keyboard {
+                            self.submit_prompt();
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+            });
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| match self.page {
+            Page::Chat => self.show_chat(ui),
+            Page::Options => self.show_options(ui, ctx),
+        });
+
+        if self.sending {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+}
+
+impl GeminiApp {
+    fn show_chat(&self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if self.messages.is_empty() {
+                    ui.add_space(48.0);
+                    ui.heading("What would you like to explore?");
+                    ui.label("Ask Gemini a question or paste a longer prompt below.");
+                    return;
+                }
+                for message in &self.messages {
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(if message.from_user { "You" } else { "Gemini" }).strong(),
+                    );
+                    let alignment = if self.config.right_to_left {
+                        Align::RIGHT
+                    } else {
+                        Align::LEFT
+                    };
+                    ui.with_layout(Layout::top_down(alignment), |ui| {
+                        ui.label(&message.text);
+                    });
+                    ui.separator();
+                }
+                if self.sending {
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("Gemini").strong());
+                    ui.spinner();
+                }
+            });
+    }
+
+    fn show_options(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.add_space(20.0);
+        ui.heading("Options");
+        ui.label("Connection and text display");
+        ui.add_space(20.0);
+        ui.set_max_width(620.0);
+
+        ui.label("Gemini API key");
+        ui.add_sized(
+            [ui.available_width(), 32.0],
+            egui::TextEdit::singleline(&mut self.config.api_key)
+                .password(true)
+                .hint_text("Paste your API key"),
+        );
+        ui.add_space(12.0);
+
+        egui::ComboBox::from_label("Model")
+            .selected_text(&self.config.model)
+            .show_ui(ui, |ui| {
+                for model in &self.config.models {
+                    ui.selectable_value(&mut self.config.model, model.clone(), model);
+                }
+            });
+        ui.add_space(12.0);
+
+        ui.checkbox(&mut self.config.right_to_left, "Right-to-left layout");
+        ui.add_space(8.0);
+        ui.label("Persian font file (.ttf or .otf)");
+        ui.add_sized(
+            [ui.available_width(), 32.0],
+            egui::TextEdit::singleline(&mut self.config.font_path)
+                .hint_text("For example: /usr/share/fonts/.../NotoNaskhArabic-Regular.ttf"),
+        );
+        ui.add_space(4.0);
+        ui.small("Install a Persian-capable font on your system, then enter its file path here.");
+        ui.add_space(20.0);
+
+        if ui.button("Save options").clicked() {
+            match apply_persian_font(ctx, &self.config.font_path) {
+                Ok(()) => match save_config(&self.config_path, &self.config) {
+                    Ok(()) => self.status = String::from("Options saved"),
+                    Err(error) => self.status = format!("Could not save options: {error}"),
+                },
+                Err(error) => self.status = format!("Could not load font: {error}"),
+            }
+        }
+    }
+
+    fn submit_prompt(&mut self) {
+        if self.sending {
+            return;
+        }
+        if self.config.api_key.trim().is_empty() {
+            self.status = String::from("Add your Gemini API key in Options");
+            self.page = Page::Options;
+            return;
+        }
+        let prompt = std::mem::take(&mut self.prompt);
+        if prompt.trim().is_empty() {
+            return;
+        }
+        self.messages.push(Message {
+            from_user: true,
+            text: prompt.clone(),
+        });
+        self.status = String::from("Waiting for Gemini...");
+        self.sending = true;
+
+        let api_key = self.config.api_key.clone();
+        let model = self.config.model.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(generate_content(&api_key, &model, &prompt));
+        });
+        self.response_receiver = Some(receiver);
+    }
+}
+
+fn default_persian_font_path() -> Option<String> {
+    [
+        "/usr/share/fonts/noto/NotoNaskhArabic-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+    ]
+    .iter()
+    .find(|path| Path::new(path).is_file())
+    .map(|path| String::from(*path))
+}
+
+fn apply_persian_font(ctx: &egui::Context, path: &str) -> Result<()> {
+    if path.trim().is_empty() {
+        ctx.set_fonts(FontDefinitions::default());
+        return Ok(());
+    }
+    let font_data = fs::read(path).with_context(|| format!("Could not read font file {path}"))?;
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        String::from("persian-user-font"),
+        std::sync::Arc::new(FontData::from_owned(font_data)),
+    );
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, String::from("persian-user-font"));
+    }
+    ctx.set_fonts(fonts);
+    Ok(())
+}
+
 fn generate_content(api_key: &str, model: &str, prompt: &str) -> Result<String, String> {
     let url =
         format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent");
@@ -507,8 +889,8 @@ fn extract_text(body: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ModelCatalog, extract_text, generate_content, persist_model_selection, save_config,
-        should_refresh_models, text_generation_models, unix_time_now,
+        Config, ModelCatalog, extract_text, generate_content, parse_args, persist_model_selection,
+        save_config, should_refresh_models, text_generation_models, unix_time_now,
     };
     use std::{env, fs};
 
@@ -520,6 +902,17 @@ mod tests {
         assert_eq!(config.api_key, "test-key");
         assert_eq!(config.model, "gemini-test");
         assert_eq!(config.models, ["gemini-3.5-flash-lite", "gemini-3.6-flash"]);
+        assert!(config.font_path.is_empty());
+        assert!(!config.right_to_left);
+    }
+
+    #[test]
+    fn gui_is_opt_in_and_parsed_as_a_flag() {
+        let terminal_options = parse_args(std::iter::empty()).unwrap();
+        assert!(!terminal_options.gui);
+
+        let gui_options = parse_args([String::from("--gui")].into_iter()).unwrap();
+        assert!(gui_options.gui);
     }
 
     #[test]
@@ -539,6 +932,8 @@ mod tests {
                 String::from("gemini-3.6-flash"),
             ],
             models_updated_at: Some(1234),
+            font_path: String::new(),
+            right_to_left: false,
         };
 
         persist_model_selection(&path, &mut config, "gemini-3.6-flash").unwrap();
@@ -617,6 +1012,8 @@ mod tests {
             model: String::from("gemini-3.6-flash"),
             models: vec![String::from("gemini-3.6-flash")],
             models_updated_at: Some(1234),
+            font_path: String::new(),
+            right_to_left: false,
         };
 
         save_config(&path, &config).unwrap();
