@@ -1,10 +1,11 @@
 use std::{
+    collections::VecDeque,
     env, fs,
     io::{self, Write, stdout},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 
 const MODEL_REFRESH_INTERVAL_SECS: i64 = 3 * 24 * 60 * 60;
+const MAX_RESPONSE_CHAR_DELAY_MS: u64 = 60_000;
 
 #[derive(Deserialize, Serialize)]
 struct Config {
@@ -31,6 +33,8 @@ struct Config {
     font_path: String,
     #[serde(default)]
     right_to_left: bool,
+    #[serde(default = "default_response_char_delay_ms")]
+    response_char_delay_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +80,8 @@ struct GeminiApp {
     messages: Vec<Message>,
     sending: bool,
     response_receiver: Option<Receiver<Result<String, String>>>,
+    typing_response: Option<VecDeque<char>>,
+    next_character_at: Instant,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -130,6 +136,9 @@ fn main() -> Result<()> {
     }
     if config.models.iter().any(|model| model.trim().is_empty()) {
         bail!("The `models` array cannot contain an empty model name");
+    }
+    if config.response_char_delay_ms > MAX_RESPONSE_CHAR_DELAY_MS {
+        bail!("`response_char_delay_ms` must not exceed {MAX_RESPONSE_CHAR_DELAY_MS}");
     }
 
     let mut status = String::from("Ready");
@@ -254,7 +263,33 @@ fn initialize_config(path: &Path) -> Result<()> {
 const CONFIG_TEMPLATE: &str = r#"api_key = "YOUR_GEMINI_API_KEY"
 model = "gemini-3.6-flash"
 models = ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
+response_char_delay_ms = 5
 "#;
+
+fn default_response_char_delay_ms() -> u64 {
+    5
+}
+
+fn print_response_with_delay(response: &str, delay_ms: u64) -> io::Result<()> {
+    let mut output = stdout().lock();
+    write!(output, "  ")?;
+    let mut characters = response.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\n' {
+            write!(output, "\n  ")?;
+        } else {
+            write!(output, "{character}")?;
+        }
+        output.flush()?;
+        if characters.peek().is_some() && delay_ms > 0 {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+    }
+    if !response.ends_with('\n') {
+        writeln!(output)?;
+    }
+    writeln!(output)
+}
 
 fn default_models() -> Vec<String> {
     vec![
@@ -407,18 +442,37 @@ fn run_terminal(config: Config, config_path: PathBuf, status: String) -> Result<
                 println!("Prompt cannot be empty.\n");
             }
             InputAction::Submit(prompt) => {
-                println!("Response:");
+                print!("Waiting for Gemini... |");
                 stdout().flush()?;
-                let response =
-                    match generate_content(&app.config.api_key, &app.config.model, &prompt) {
-                        Ok(response) => response,
-                        Err(error) => format!("Error: {error}"),
-                    };
-                print!("  {}", response.replace('\n', "\n  "));
-                if !response.ends_with('\n') {
-                    println!();
-                }
-                println!();
+                let api_key = app.config.api_key.clone();
+                let model = app.config.model.clone();
+                let (sender, receiver) = mpsc::channel();
+                thread::spawn(move || {
+                    let _ = sender.send(generate_content(&api_key, &model, &prompt));
+                });
+                let frames = ['|', '/', '-', '\\'];
+                let mut frame = 0;
+                let result = loop {
+                    match receiver.recv_timeout(Duration::from_millis(100)) {
+                        Ok(response) => break response,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            print!("\rWaiting for Gemini... {}", frames[frame % frames.len()]);
+                            stdout().flush()?;
+                            frame += 1;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            break Err(String::from("Request stopped unexpectedly"));
+                        }
+                    }
+                };
+                crossterm::execute!(
+                    stdout(),
+                    crossterm::cursor::MoveToColumn(0),
+                    Clear(ClearType::CurrentLine)
+                )?;
+                println!("Response:");
+                let response = result.unwrap_or_else(|error| format!("Error: {error}"));
+                print_response_with_delay(&response, app.config.response_char_delay_ms)?;
             }
         }
     }
@@ -581,6 +635,8 @@ fn run_gui(config: Config, config_path: PathBuf, status: String) -> Result<()> {
                 messages: Vec::new(),
                 sending: false,
                 response_receiver: None,
+                typing_response: None,
+                next_character_at: Instant::now(),
             }))
         }),
     )
@@ -597,10 +653,11 @@ impl eframe::App for GeminiApp {
             Some(Ok(Ok(response))) => {
                 self.messages.push(Message {
                     from_user: false,
-                    text: response,
+                    text: String::new(),
                 });
-                self.status = String::from("Ready");
                 self.sending = false;
+                self.typing_response = Some(response.chars().collect());
+                self.next_character_at = Instant::now();
                 self.response_receiver = None;
             }
             Some(Ok(Err(error))) => {
@@ -618,6 +675,26 @@ impl eframe::App for GeminiApp {
                 self.response_receiver = None;
             }
             Some(Err(TryRecvError::Empty)) | None => {}
+        }
+
+        let typing_finished = if let Some(characters) = &mut self.typing_response {
+            let delay = Duration::from_millis(self.config.response_char_delay_ms);
+            let now = Instant::now();
+            while !characters.is_empty() && now >= self.next_character_at {
+                if let Some(character) = characters.pop_front() {
+                    if let Some(message) = self.messages.last_mut() {
+                        message.text.push(character);
+                    }
+                }
+                self.next_character_at += delay;
+            }
+            characters.is_empty()
+        } else {
+            false
+        };
+        if typing_finished {
+            self.typing_response = None;
+            self.status = String::from("Ready");
         }
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
@@ -642,6 +719,9 @@ impl eframe::App for GeminiApp {
             });
             if !self.status.is_empty() {
                 ui.small(&self.status);
+            }
+            if self.sending && self.page == Page::Options {
+                ui.spinner();
             }
         });
 
@@ -691,8 +771,13 @@ impl eframe::App for GeminiApp {
             Page::Options => self.show_options(ui, ctx),
         });
 
-        if self.sending {
-            ctx.request_repaint_after(Duration::from_millis(100));
+        if self.sending || self.typing_response.is_some() {
+            let repaint_delay = if self.typing_response.is_some() {
+                1
+            } else {
+                100
+            };
+            ctx.request_repaint_after(Duration::from_millis(repaint_delay));
         }
     }
 }
@@ -755,6 +840,16 @@ impl GeminiApp {
                     ui.selectable_value(&mut self.config.model, model.clone(), model);
                 }
             });
+        ui.add_space(12.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Response character delay");
+            ui.add(
+                egui::DragValue::new(&mut self.config.response_char_delay_ms)
+                    .range(0..=MAX_RESPONSE_CHAR_DELAY_MS)
+                    .suffix(" ms"),
+            );
+        });
         ui.add_space(12.0);
 
         ui.checkbox(&mut self.config.right_to_left, "Right-to-left layout");
@@ -904,6 +999,7 @@ mod tests {
         assert_eq!(config.models, ["gemini-3.5-flash-lite", "gemini-3.6-flash"]);
         assert!(config.font_path.is_empty());
         assert!(!config.right_to_left);
+        assert_eq!(config.response_char_delay_ms, 5);
     }
 
     #[test]
@@ -934,6 +1030,7 @@ mod tests {
             models_updated_at: Some(1234),
             font_path: String::new(),
             right_to_left: false,
+            response_char_delay_ms: 5,
         };
 
         persist_model_selection(&path, &mut config, "gemini-3.6-flash").unwrap();
@@ -1014,6 +1111,7 @@ mod tests {
             models_updated_at: Some(1234),
             font_path: String::new(),
             right_to_left: false,
+            response_char_delay_ms: 5,
         };
 
         save_config(&path, &config).unwrap();

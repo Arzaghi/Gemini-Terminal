@@ -3,3 +3,4 @@ model = "gemini-3.6-flash"
 models = ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
 font_path = ""
 right_to_left = false
+response_char_delay_ms = 5
