@@ -272,6 +272,14 @@ fn default_response_char_delay_ms() -> u64 {
 
 fn print_response_with_delay(response: &str, delay_ms: u64) -> io::Result<()> {
     let mut output = stdout().lock();
+    if delay_ms == 0 {
+        write!(output, "  {}", response.replace('\n', "\n  "))?;
+        if !response.ends_with('\n') {
+            writeln!(output)?;
+        }
+        return writeln!(output);
+    }
+
     write!(output, "  ")?;
     let mut characters = response.chars().peekable();
     while let Some(character) = characters.next() {
